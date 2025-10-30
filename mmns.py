@@ -57,12 +57,18 @@ class Node:
         # create netns
         _run(f"ip netns add {shlex.quote(self.name)}")
 
-    def add_iface(self) -> str:
-        """自動インタフェース名生成: <name>-eth{n} を返す（ただし実体作成は create_link が行う）"""
-        iface = f"{self.name}-eth{self.if_count}"
-        self.if_count += 1
-        self.interfaces.append(iface)
-        return iface
+#    def add_iface(self) -> str:
+#        """自動インタフェース名生成: <name>-eth{n} を返す（ただし実体作成は create_link が行う）"""
+#        iface = f"{self.name}-eth{self.if_count}"
+#        self.if_count += 1
+#        self.interfaces.append(iface)
+#        return iface
+    def add_iface(self, ifname=None):
+        """インタフェース名を登録して返す"""
+        if ifname is None:
+            ifname = f"{self.name}-eth{len(self.interfaces)}"
+        self.interfaces.append(ifname)
+        return ifname
 
     def cmd(self, command: str, timeout: int = None) -> str:
         """ノード内でコマンド実行。mount_override が存在する場合はその mount namespace を共有する。
@@ -88,12 +94,12 @@ class Node:
             except Exception:
                 pass
             self.mount_ns_pid = None
-        # delete netns
-        try:
-            _run(f"ip netns delete {shlex.quote(self.name)}")
-        except Exception:
-            # might be already deleted
-            pass
+#        # delete netns
+#        try:
+#            _run(f"ip netns delete {shlex.quote(self.name)}")
+#        except Exception:
+#            # might be already deleted
+#            pass
 
     def mount_override(self, target_path: str, src_path: str):
         """指定した target_path を src_path で override するための mount namespace helper を起動する。
@@ -158,23 +164,29 @@ class Node:
 _nodes = {}
 
 
-def create_link(node1: Node, node2: Node) -> Tuple[str, str]:
-    """2ノード間に veth ペアを作成し、それぞれの Node にアタッチして UP にする。
+class Link:
+    def __init__(self, node1, node2, if1_name=None, if2_name=None):
+        if1 = if1_name or f"{node1.name}-eth{len(node1.interfaces)}"
+        if2 = if2_name or f"{node2.name}-eth{len(node2.interfaces)}"
 
-    auto-generated iface names: <node>-ethX
-    戻り値: (iface_on_node1, iface_on_node2)
-    """
-    iface1 = node1.add_iface()
-    iface2 = node2.add_iface()
-    # create veth
-    _run(f"ip link add {shlex.quote(iface1)} type veth peer name {shlex.quote(iface2)}")
-    # move to namespaces
-    _run(f"ip link set {shlex.quote(iface1)} netns {shlex.quote(node1.name)}")
-    _run(f"ip link set {shlex.quote(iface2)} netns {shlex.quote(node2.name)}")
-    # bring interfaces up inside each namespace
-    node1.cmd(f"ip link set {shlex.quote(iface1)} up")
-    node2.cmd(f"ip link set {shlex.quote(iface2)} up")
-    return iface1, iface2
+        _run(f"ip link add {if1} type veth peer name {if2}")
+        _run(f"ip link set {if1} netns {node1.name}")
+        _run(f"ip link set {if2} netns {node2.name}")
+
+        node1.add_iface(if1)
+        node2.add_iface(if2)
+
+    def delete(self):
+        # 明示的に削除する
+        run(f"ip -n {self.node1} link del {self.if1}")
+
+    def __del__(self):
+        # オブジェクト破棄時にも安全に削除
+        try:
+            self.delete()
+        except Exception:
+            pass
+
 
 
 def cleanup():
