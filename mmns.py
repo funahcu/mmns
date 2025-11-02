@@ -69,22 +69,6 @@ class Node:
         _run(f"ip -n {self.name} link set {ifname} up")
         return ifname
 
-    def cmd(self, command: str, timeout: int = None) -> str:
-        """ノード内でコマンド実行。mount_override が存在する場合はその mount namespace を共有する。
-
-        戻り値: 標準出力 + 標準エラー (両方) の文字列
-        """
-        # If a mount namespace helper process is present, use nsenter to enter both mount and net namespaces
-        if self.mount_ns_pid:
-            cmd = f"nsenter --target {int(self.mount_ns_pid)} --mount --net -- bash -c {shlex.quote(command)}"
-            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        else:
-            # fallback: use ip netns exec for network namespace only
-            cmd = f"ip netns exec {shlex.quote(self.name)} bash -c {shlex.quote(command)}"
-            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        out = (proc.stdout or "") + (proc.stderr or "")
-        return out
-
     def cleanup(self):
         """ノード固有の後始末。mount helper プロセスがあれば殺す。"""
         if self.mount_ns_pid:
@@ -95,63 +79,110 @@ class Node:
             self.mount_ns_pid = None
 
     def mount_override(self, target_path: str, src_path: str):
-        """指定した target_path を src_path で override するための mount namespace helper を起動する。
+        """指定した target_path を src_path で override する mount namespace helper"""
 
-        - target_path: ノード側の見えるパス（絶対パス推奨）。ファイルまたはディレクトリを指定可能。
-        - src_path: ホスト側の実体パス（ファイル または ディレクトリ）
-
-        実装:
-        1) ip netns exec <node> unshare --mount bash -c 'mkdir -p $(dirname target); mount --bind src target; exec sleep infinity' &
-        2) 起動したプロセス pid を self.mount_ns_pid に保存
-        3) 以後の cmd() は nsenter --target <pid> --mount --net で実行され、mount override が見える
-
-        注意:
-        - target_path の親ディレクトリが存在しないと失敗するため、mkdir -p を実行している
-        - root 権限が必要
-        """
-        target = target_path
-        src = src_path
-        # basic checks
-        if not os.path.exists(src):
-            raise FileNotFoundError(f"src path not found: {src}")
-        if not os.path.isabs(target):
+        if not os.path.exists(src_path):
+            raise FileNotFoundError(f"src path not found: {src_path}")
+        if not os.path.isabs(target_path):
             raise ValueError("target_path must be absolute")
+        if not os.path.isabs(src_path):
+            raise ValueError("src_path must be absolute")
 
-        # craft command
-        # ensure parent exists inside the namespace by creating it on host if possible
-        parent = os.path.dirname(target)
-        # We cannot create inside namespace directly; ensure parent exists on host so bind can succeed
-        # If parent does not exist on host, create it (this modifies host fs). Alternatively, bind to a temp location.
-        if not os.path.exists(parent):
+        # 既存のhelperがあればクリーンアップ
+        if self.mount_ns_pid:
             try:
-                os.makedirs(parent, exist_ok=True)
-            except Exception as e:
-                # fallback: raise
-                raise
+                os.kill(int(self.mount_ns_pid), signal.SIGTERM)
+                time.sleep(0.1)
+            except Exception:
+                pass
 
-        # Prepare the unshare command executed inside the node's netns. It will create a private mount namespace,
-        # perform the bind mount, then sleep forever to keep the mount namespace alive.
-        # Use setsid to allow backgrounding independent pid.
-        # We use bash -c 'mount --bind ... && exec sleep infinity' so that the process remains and holds mount ns.
-        cmd = (
-            f"ip netns exec {shlex.quote(self.name)} "
-            f"unshare --mount --propagation private bash -c \"mkdir -p {shlex.quote(parent)} && "
-            f"mount --bind {shlex.quote(src)} {shlex.quote(target)} && exec sleep infinity\""
+        parent = os.path.dirname(target_path)
+        is_file = os.path.isfile(src_path)
+
+        # マウント名前空間の影響を受けない場所を使う
+        pid_dir = "/run/mmns"
+        os.makedirs(pid_dir, exist_ok=True)
+        pid_file = f"{pid_dir}/helper_{self.name}.pid"
+        log_file = f"{pid_dir}/helper_{self.name}.log"
+
+        # 準備コマンド
+        if is_file:
+            prep_cmd = f"mkdir -p {shlex.quote(parent)} && touch {shlex.quote(target_path)}"
+        else:
+            prep_cmd = f"mkdir -p {shlex.quote(target_path)}"
+
+        inner_script = (
+            f'{prep_cmd} && '
+            f'mount --bind {shlex.quote(src_path)} {shlex.quote(target_path)} && '
+            f'echo $$ > {pid_file} && '
+            f'exec sleep infinity'
         )
-        # Start as backgrounded subprocess and record pid
-        # We start with Popen so we can get pid
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=os.setsid)
-        # Give a short time to allow mount to occur or fail
-        time.sleep(0.1)
-        # check if process is alive and mount succeeded
-        if p.poll() is not None:
-            # process exited -> error
-            out, err = p.communicate()
-            raise RuntimeError(f"mount_override helper failed: out={out} err={err}")
-        self.mount_ns_pid = p.pid
-        # note: keep handle to child by leaving it running; cleanup() will kill it
-        return self.mount_ns_pid
 
+        cmd = [
+            'ip', 'netns', 'exec', self.name,
+            'unshare', '--mount', '--propagation', 'private',
+            'bash', '-c', inner_script
+        ]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=open(log_file, 'w'),
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid
+        )
+
+        # PIDファイルを待つ
+        for i in range(30):
+            time.sleep(0.1)
+            if os.path.exists(pid_file):
+                break
+            if proc.poll() is not None:
+                with open(log_file, 'r') as f:
+                    raise RuntimeError(f"mount_override failed: {f.read()}")
+        else:
+            proc.terminate()
+            with open(log_file, 'r') as f:
+                raise RuntimeError(f"mount_override timeout: {f.read()}")
+
+        with open(pid_file, 'r') as f:
+            helper_pid = int(f.read().strip())
+
+        os.unlink(pid_file)
+
+        self.mount_ns_pid = helper_pid
+        return helper_pid
+
+    def cmd(self, command: str, timeout: int = None) -> str:
+        """ノード内でコマンド実行。mount_override が存在する場合はその mount namespace を共有する。"""
+
+        if self.mount_ns_pid:
+            # mount helperプロセスが生きているか確認
+            try:
+                os.kill(int(self.mount_ns_pid), 0)  # signal 0 = 生存確認
+            except (OSError, ProcessLookupError):
+                print(f"[warn] mount helper process {self.mount_ns_pid} is dead, falling back to netns exec")
+                self.mount_ns_pid = None
+
+            # デバッグ：helperプロセスがどのnetnsにいるか確認
+            netns_check = subprocess.run(
+                f"ip netns identify {int(self.mount_ns_pid)}",
+                shell=True, capture_output=True, text=True
+            )
+            helper_netns = netns_check.stdout.strip()
+#            print(f"[debug] Helper PID {self.mount_ns_pid} is in netns: '{helper_netns}' (expected: '{self.name}')")
+
+            if self.mount_ns_pid:
+                # mount namespaceとnetwork namespaceの両方に入る
+                cmd = f"nsenter --target {int(self.mount_ns_pid)} --mount --net bash -c {shlex.quote(command)}"
+                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+                out = (proc.stdout or "") + (proc.stderr or "")
+                return out
+
+        # fallback: network namespaceのみ
+        cmd = f"ip netns exec {shlex.quote(self.name)} bash -c {shlex.quote(command)}"
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return out
 
 # Global nodes registry for convenience
 _nodes = {}
