@@ -2,12 +2,11 @@
 mmns.py
 軽量Mininet風モジュール（import 可能）
 - 要求: root 権限で実行する前提
-- 提供機能: Node クラス, create_link, cleanup, CLI, mount_override
+- 提供機能: Node クラス, Link クラス, cleanup, CLI, mount_override, ensure_nat_bridge, connect_node_to_bridge
 
 注意:
 - mount_override は "永続的なマウント名前空間プロセス" を起動して
   そのプロセスの mount namespace を以後のコマンド実行に使います。
-- そのため mount_override を使う場合は root 権限が必須です。
 
 設計上の簡略化点:
 - ip/netns/unshare/nsenter/ mount コマンドを外部コマンドで実行します。
@@ -16,7 +15,7 @@ mmns.py
 >>> import mmns
 >>> h1 = mmns.Node('h1')
 >>> h2 = mmns.Node('h2')
->>> mmns.create_link(h1,h2)
+>>> mmns.Link(h1,h2)
 >>> h1.cmd('ip addr add 10.0.0.1/24 dev h1-eth0')
 >>> h2.cmd('ip addr add 10.0.0.2/24 dev h2-eth0')
 >>> mmns.CLI({'h1':h1,'h2':h2})
@@ -31,6 +30,7 @@ import os
 import shlex
 import signal
 import time
+import ipaddress
 from typing import Dict, Tuple
 
 
@@ -54,20 +54,19 @@ class Node:
         self.interfaces = []
         self.if_count = 0
         self.mount_ns_pid = None
+
         # create netns
         _run(f"ip netns add {shlex.quote(self.name)}")
 
-#    def add_iface(self) -> str:
-#        """自動インタフェース名生成: <name>-eth{n} を返す（ただし実体作成は create_link が行う）"""
-#        iface = f"{self.name}-eth{self.if_count}"
-#        self.if_count += 1
-#        self.interfaces.append(iface)
-#        return iface
+        # bring up loopback
+        _run(f"ip netns exec {shlex.quote(self.name)} ip link set lo up")
+
     def add_iface(self, ifname=None):
         """インタフェース名を登録して返す"""
         if ifname is None:
             ifname = f"{self.name}-eth{len(self.interfaces)}"
         self.interfaces.append(ifname)
+        _run(f"ip -n {self.name} link set {ifname} up")
         return ifname
 
     def cmd(self, command: str, timeout: int = None) -> str:
@@ -94,12 +93,6 @@ class Node:
             except Exception:
                 pass
             self.mount_ns_pid = None
-#        # delete netns
-#        try:
-#            _run(f"ip netns delete {shlex.quote(self.name)}")
-#        except Exception:
-#            # might be already deleted
-#            pass
 
     def mount_override(self, target_path: str, src_path: str):
         """指定した target_path を src_path で override するための mount namespace helper を起動する。
@@ -178,7 +171,7 @@ class Link:
 
     def delete(self):
         # 明示的に削除する
-        run(f"ip -n {self.node1} link del {self.if1}")
+        _run(f"ip -n {self.node1} link del {self.if1}")
 
     def __del__(self):
         # オブジェクト破棄時にも安全に削除
@@ -187,7 +180,72 @@ class Link:
         except Exception:
             pass
 
+def ensure_nat_bridge(bridge_name="br-nat", subnet="10.10.0.0/24", external_if="eth0"):
+    """Dockerのbridgeネットワーク相当を構築"""
+    # すでに存在する場合は何もしない
+    existing = _run(f"ip link show {bridge_name}", capture_output=True, check=False)
+    existing_out = existing.stdout if existing.stdout else ""
+    if "does not exist" not in existing_out and existing_out:
+        print(f"[bridge] Using existing {bridge_name}")
+        return
 
+    net = ipaddress.ip_network(subnet, strict=False)
+    bridge_addr = f"{net.network_address + 1}/{net.prefixlen}"
+
+    print(f"[bridge] Creating NAT bridge {bridge_name}")
+    _run(f"ip link add name {bridge_name} type bridge", check=False)
+    _run(f"ip addr add {bridge_addr} dev {bridge_name}", check=False)
+    _run(f"ip link set {bridge_name} up")
+
+    # IP転送を有効化
+    _run("sysctl -w net.ipv4.ip_forward=1")
+
+    # NAT設定（重複を避けるため既存ルールチェック）
+    rule_result = _run("iptables -t nat -S POSTROUTING", capture_output=True)
+    rule_check = rule_result.stdout if rule_result.stdout else ""
+    rule = f"-A POSTROUTING -s {subnet} -o {external_if} -j MASQUERADE"
+    if rule not in rule_check:
+        _run(f"iptables -t nat {rule}")
+        print(f"[iptables] Added NAT rule for {subnet} via {external_if}")
+    else:
+        print("[iptables] NAT rule already present")
+
+_bridge_ip_alloc = {}
+
+def connect_node_to_bridge(node, bridge="br-nat", subnet="10.10.0.0/24", ip_last=None):
+    """ノードをbridgeに接続してNAT経由で外部通信可能にする"""
+    net = ipaddress.ip_network(subnet, strict=False)
+    base = str(net.network_address).rsplit(".", 1)[0] + "."
+
+    if bridge not in _bridge_ip_alloc:
+        _bridge_ip_alloc[bridge] = 2
+
+    if ip_last is None:
+        ip_last = _bridge_ip_alloc[bridge]
+        _bridge_ip_alloc[bridge] += 1
+
+    iface = f"{node.name}-eth{len(node.interfaces)}"
+    _run(f"ip link add {iface} type veth peer name {iface}-br")
+    _run(f"ip link set {iface} netns {node.name}")
+    _run(f"ip link set {iface}-br master {bridge}")
+    _run(f"ip link set {iface}-br up")
+
+    ip_addr = f"{base}{ip_last}/{net.prefixlen}"
+    gw_addr = f"{base}1"
+
+    node.add_iface(iface)
+#    _run(f"ip -n {node.name} link set {iface} up")
+    _run(f"ip -n {node.name} addr add {ip_addr} dev {iface}")
+    _run(f"ip -n {node.name} route add default via {gw_addr}")
+
+def bridge_exists(bridge_name: str) -> bool:
+    """Check if a given bridge device exists."""
+    result = subprocess.run(
+        ["ip", "link", "show", bridge_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return result.returncode == 0
 
 def cleanup():
     """全ノードの cleanup を呼び出してから、残った netns を削除する。
@@ -220,8 +278,20 @@ def cleanup():
     except Exception:
         pass
 
+    print("[cleanup] Deleting bridge br-nat if exists...")
+    if bridge_exists("br-nat"):
+        try:
+            delete_bridge("br-nat")
+        except Exception as e:
+            print(f"[cleanup] Warning: failed to delete bridge br-nat: {e}")
+
 
 atexit.register(cleanup)
+
+def delete_bridge(bridge_name):
+    print(f"[cleanup] Deleting bridge {bridge_name}")
+    _run(f"ip link set {bridge_name} down", check=False)
+    _run(f"ip link delete {bridge_name} type bridge", check=False)
 
 
 def CLI(nodes: Dict[str, Node]):

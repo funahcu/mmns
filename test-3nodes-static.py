@@ -20,10 +20,10 @@ r1.cmd("ip addr add 10.0.2.254/24 dev r1-eth1")
 h2.cmd("ip addr add 10.0.2.1/24 dev h2-eth0")
 
 # インタフェースを有効化
-for n in (h1, r1, h2):
-    n.cmd("ip link set lo up")
-    for iface in n.interfaces:
-        n.cmd(f"ip link set {iface} up")
+#for n in (h1, r1, h2):
+#    n.cmd("ip link set lo up")
+#    for iface in n.interfaces:
+#        n.cmd(f"ip link set {iface} up")
 
 # ルーティング設定
 h1.cmd("ip route add default via 10.0.1.254")
@@ -38,5 +38,5 @@ print("Try: h1 ping -c 2 10.0.2.1\n")
 # CLIを起動
 CLI({"h1": h1, "r1": r1, "h2": h2})
 
-# 終了処理
-cleanup()
+## 終了処理
+#cleanup()
