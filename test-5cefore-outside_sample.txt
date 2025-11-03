@@ -1,0 +1,27 @@
+mmns> h5 cefroute add ccnx:/ udp 10.0.0.5 9896
+mmns> h4 cefroute add ccnx:/ udp 10.0.0.4 9896
+mmns> h3 cefroute add ccnx:/ udp 10.0.0.3 9896
+mmns> h2 cefroute add ccnx:/ udp 10.0.0.2 9896
+mmns> h1 cefroute add ccnx:/ udp 192.168.33.12 9896
+mmns> h5 cefgetfile ccnx:/100KB -f output.dat
+[cefgetfile] Start
+[cefgetfile] Parsing parameters ... OK
+[cefgetfile] Init Cefore Client package ... OK
+[cefgetfile] Conversion from URI into Name ... OK
+[cefgetfile] Checking the output file ... OK
+[cefgetfile] Connect to cefnetd ... OK
+[cefgetfile] URI=ccnx:/100KB
+[cefgetfile] Start sending Interests
+[cefgetfile] Completed to get all the chunks.
+[cefgetfile] Unconnect to cefnetd ... OK
+[cefgetfile] Terminate
+[cefgetfile] Rx Frames (All)           = 100
+[cefgetfile] Rx Frames (ContentObject) = 100
+[cefgetfile] Rx Bytes (All)            = 104100
+[cefgetfile] Rx Bytes (ContentObject)  = 102400
+[cefgetfile] Duration                  = 0.073 sec
+[cefgetfile] Throughput                = 11560565 bps
+[cefgetfile] Goodput                   = 11371776 bps
+[cefgetfile] Jitter (Ave)              = 720 us
+[cefgetfile] Jitter (Max)              = 11442 us
+[cefgetfile] Jitter (Var)              = 1470570 us
