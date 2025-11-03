@@ -1,0 +1,63 @@
+$ sudo python3 test-cefore-outside.py 
+[run] ip link show br-nat
+[bridge] Creating NAT bridge br-nat
+[run] ip link add name br-nat type bridge
+[run] ip addr add 10.0.0.1/24 dev br-nat
+[run] ip link set br-nat up
+[run] sysctl -w net.ipv4.ip_forward=1
+net.ipv4.ip_forward = 1
+[run] iptables -t nat -S POSTROUTING
+[iptables] NAT rule already present
+[run] ip netns add h1
+[run] ip netns exec h1 ip link set lo up
+[run] ip netns add h2
+[run] ip netns exec h2 ip link set lo up
+[run] ip link add h1-eth0 type veth peer name h1-eth0-br
+[run] ip link set h1-eth0 netns h1
+[run] ip link set h1-eth0-br master br-nat
+[run] ip link set h1-eth0-br up
+[run] ip -n h1 link set h1-eth0 up
+[run] ip -n h1 addr add 10.0.0.2/24 dev h1-eth0
+[run] ip -n h1 route add default via 10.0.0.1
+[run] ip link add h2-eth0 type veth peer name h2-eth0-br
+[run] ip link set h2-eth0 netns h2
+[run] ip link set h2-eth0-br master br-nat
+[run] ip link set h2-eth0-br up
+[run] ip -n h2 link set h2-eth0 up
+[run] ip -n h2 addr add 10.0.0.3/24 dev h2-eth0
+[run] ip -n h2 route add default via 10.0.0.1
+h1 starting cefnetd
+h2 starting cefnetd
+Entering mini CLI. Type 'exit' to quit.
+mmns> h1 cefroute add ccnx:/ udp 10.0.0.1 9896
+mmns> h2 cefroute add ccnx:/ udp 10.0.0.1 9896
+mmns> h1 cefgetfile ccnx:/100KB -f output.dat
+[cefgetfile] Start
+[cefgetfile] Parsing parameters ... OK
+[cefgetfile] Init Cefore Client package ... OK
+[cefgetfile] Conversion from URI into Name ... OK
+[cefgetfile] Checking the output file ... OK
+[cefgetfile] Connect to cefnetd ... OK
+[cefgetfile] URI=ccnx:/100KB
+[cefgetfile] Start sending Interests
+[cefgetfile] Completed to get all the chunks.
+[cefgetfile] Unconnect to cefnetd ... OK
+[cefgetfile] Terminate
+[cefgetfile] Rx Frames (All)           = 100
+[cefgetfile] Rx Frames (ContentObject) = 100
+[cefgetfile] Rx Bytes (All)            = 104100
+[cefgetfile] Rx Bytes (ContentObject)  = 102400
+[cefgetfile] Duration                  = 0.020 sec
+[cefgetfile] Throughput                = 43896268 bps
+[cefgetfile] Goodput                   = 43179422 bps
+[cefgetfile] Jitter (Ave)              = 189 us
+[cefgetfile] Jitter (Max)              = 1754 us
+[cefgetfile] Jitter (Var)              = 31758 us
+
+mmns> exit
+Exiting CLI...
+[run] ip -all netns delete
+[cleanup] Deleting bridge br-nat if exists...
+[cleanup] Deleting bridge br-nat
+[run] ip link set br-nat down
+[run] ip link delete br-nat type bridge
