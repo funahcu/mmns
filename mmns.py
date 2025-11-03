@@ -1,6 +1,10 @@
 """
 mmns.py
 軽量Mininet風モジュール（import 可能）
+
+SPDX-License-Identifier: MIT
+Copyright (c) 2025 Junichi FUNASAKA
+
 - 要求: root 権限で実行する前提
 - 提供機能: Node クラス, Link クラス, cleanup, CLI, mount_override, ensure_nat_bridge, connect_node_to_bridge
 
