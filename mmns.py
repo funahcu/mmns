@@ -58,6 +58,7 @@ class Node:
         self.interfaces = []
         self.if_count = 0
         self.mount_ns_pid = None
+        self.mount_overrides = []
 
         # create netns
         _run(f"ip netns add {shlex.quote(self.name)}")
@@ -92,33 +93,47 @@ class Node:
         if not os.path.isabs(src_path):
             raise ValueError("src_path must be absolute")
 
-        # 既存のhelperがあればクリーンアップ
-        if self.mount_ns_pid:
-            try:
-                os.kill(int(self.mount_ns_pid), signal.SIGTERM)
-                time.sleep(0.1)
-            except Exception:
-                pass
+        # 最初のマウント時のみhelperプロセスを起動
+        if self.mount_ns_pid is None:
+            self._start_mount_helper()
 
-        parent = os.path.dirname(target_path)
-        is_file = os.path.isfile(src_path)
+        # helperプロセスが生きているか確認
+        try:
+            os.kill(int(self.mount_ns_pid), 0)
+        except (OSError, ProcessLookupError):
+            print(f"[warn] mount helper died, restarting...")
+            self.mount_ns_pid = None
+            self.mount_overrides = []
+            self._start_mount_helper()
 
-        # マウント名前空間の影響を受けない場所を使う
+        # 既に同じマウントがあるかチェック
+        for existing_target, existing_src in self.mount_overrides:
+            if existing_target == target_path:
+                print(f"[warn] {target_path} is already mounted, unmounting first")
+                self._unmount_in_helper(target_path)
+                self.mount_overrides.remove((existing_target, existing_src))
+                break
+
+        # 新しいマウントを追加
+        self._add_mount_in_helper(target_path, src_path)
+        self.mount_overrides.append((target_path, src_path))
+
+        print(f"[mount_override] Mounted {src_path} -> {target_path} in {self.name}")
+        print(f"[mount_override] Total mounts: {len(self.mount_overrides)}")
+        return self.mount_ns_pid
+
+
+    def _start_mount_helper(self):
+        """mount namespace helperプロセスを起動"""
         pid_dir = "/run/mmns"
         os.makedirs(pid_dir, exist_ok=True)
         pid_file = f"{pid_dir}/helper_{self.name}.pid"
         log_file = f"{pid_dir}/helper_{self.name}.log"
 
-        # 準備コマンド
-        if is_file:
-            prep_cmd = f"mkdir -p {shlex.quote(parent)} && touch {shlex.quote(target_path)}"
-        else:
-            prep_cmd = f"mkdir -p {shlex.quote(target_path)}"
-
+        # 空のhelperプロセスを起動（マウントはまだしない）
         inner_script = (
-            f'{prep_cmd} && '
-            f'mount --bind {shlex.quote(src_path)} {shlex.quote(target_path)} && '
             f'echo $$ > {pid_file} && '
+            f'echo "Mount helper started" && '
             f'exec sleep infinity'
         )
 
@@ -142,19 +157,57 @@ class Node:
                 break
             if proc.poll() is not None:
                 with open(log_file, 'r') as f:
-                    raise RuntimeError(f"mount_override failed: {f.read()}")
+                    raise RuntimeError(f"mount helper failed: {f.read()}")
         else:
             proc.terminate()
-            with open(log_file, 'r') as f:
-                raise RuntimeError(f"mount_override timeout: {f.read()}")
+            raise RuntimeError(f"mount helper timeout")
 
         with open(pid_file, 'r') as f:
-            helper_pid = int(f.read().strip())
+            self.mount_ns_pid = int(f.read().strip())
 
         os.unlink(pid_file)
+        print(f"[mount_helper] Started helper process (PID: {self.mount_ns_pid}) for {self.name}")
 
-        self.mount_ns_pid = helper_pid
-        return helper_pid
+    def _add_mount_in_helper(self, target_path: str, src_path: str):
+        """既存のhelperプロセス内で新しいマウントを追加"""
+        parent = os.path.dirname(target_path)
+        is_file = os.path.isfile(src_path)
+
+        if is_file:
+            prep_cmd = f"mkdir -p {shlex.quote(parent)} && touch {shlex.quote(target_path)}"
+        else:
+            prep_cmd = f"mkdir -p {shlex.quote(target_path)}"
+
+        mount_cmd = (
+            f"{prep_cmd} && "
+            f"mount --bind {shlex.quote(src_path)} {shlex.quote(target_path)}"
+        )
+
+        # nsenterでhelperプロセスのマウント名前空間に入ってマウント実行
+        cmd = f"nsenter --target {int(self.mount_ns_pid)} --mount bash -c {shlex.quote(mount_cmd)}"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to add mount: {result.stderr}")
+
+    def _unmount_in_helper(self, target_path: str):
+        """helperプロセス内でマウントを解除"""
+        unmount_cmd = f"umount {shlex.quote(target_path)}"
+        cmd = f"nsenter --target {int(self.mount_ns_pid)} --mount bash -c {shlex.quote(unmount_cmd)}"
+        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+
+    def list_mounts(self):
+        """現在のマウント一覧を表示"""
+        print(f"\n[{self.name}] Mount overrides:")
+        for target, src in self.mount_overrides:
+            print(f"  {target} <- {src}")
+
+        # 実際のマウント状態を確認
+        if self.mount_ns_pid:
+            result = self.cmd("mount | grep -E '(bind|mmns)'")
+            if result.strip():
+                print(f"\n[{self.name}] Actual mounts in namespace:")
+                print(result)
 
     def cmd(self, command: str, timeout: int = None) -> str:
         """ノード内でコマンド実行。mount_override が存在する場合はその mount namespace を共有する。"""
