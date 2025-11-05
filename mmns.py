@@ -30,6 +30,7 @@ Copyright (c) 2025 Junichi FUNASAKA
 
 import subprocess
 import atexit
+import readline
 import os
 import shlex
 import signal
@@ -121,7 +122,6 @@ class Node:
         print(f"[mount_override] Mounted {src_path} -> {target_path} in {self.name}")
         print(f"[mount_override] Total mounts: {len(self.mount_overrides)}")
         return self.mount_ns_pid
-
 
     def _start_mount_helper(self):
         """mount namespace helperプロセスを起動"""
@@ -393,6 +393,32 @@ def CLI(nodes: Dict[str, Node]):
       all uname -a    # 全ノードで実行
       exit
     """
+    # 履歴ファイルのパス
+    histfile = os.path.join(os.path.expanduser("~"), ".mmns_history")
+
+    # 履歴ファイルが存在すれば読み込む
+    try:
+        readline.read_history_file(histfile)
+        # 履歴の最大サイズを設定（デフォルトは無制限）
+        readline.set_history_length(1000)
+    except FileNotFoundError:
+        pass
+
+    # 終了時に履歴を保存
+    atexit.register(readline.write_history_file, histfile)
+
+    # タブ補完の設定（オプション）
+    def completer(text, state):
+        """タブ補完関数"""
+        options = list(nodes.keys()) + ['all', 'exit', 'quit', 'help']
+        matches = [opt for opt in options if opt.startswith(text)]
+        if state < len(matches):
+            return matches[state]
+        return None
+
+    readline.set_completer(completer)
+    readline.parse_and_bind("tab: complete")
+
     print("Entering mini CLI. Type 'exit' to quit.")
     # register nodes in global
     _nodes.update(nodes)
@@ -406,6 +432,22 @@ def CLI(nodes: Dict[str, Node]):
                 continue
             if line in ('exit', 'quit'):
                 break
+            if line == 'help':
+                print("""
+Available commands:
+  <node> <command>  - Run command on specific node
+  all <command>     - Run command on all nodes
+  nodes             - List all nodes
+  exit/quit         - Exit CLI
+  help              - Show this help
+                """)
+                continue
+            if line == 'nodes':
+                print("Available nodes:")
+                for name in nodes.keys():
+                    print(f"  - {name}")
+                continue
+
             parts = line.split(maxsplit=1)
             if len(parts) == 1:
                 print("Usage: <node|all> <command>")
@@ -423,5 +465,7 @@ def CLI(nodes: Dict[str, Node]):
                 out = nodes[target].cmd(cmd)
                 if out:
                     print(out)
+    except KeyboardInterrupt:
+        print("\nInterrupted")
     finally:
         print("Exiting CLI...")
