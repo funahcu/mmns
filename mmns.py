@@ -241,6 +241,60 @@ class Node:
         out = (proc.stdout or "") + (proc.stderr or "")
         return out
 
+    def cmd_stream(self, command: str, timeout: int = None) -> int:
+        """ノード内でコマンド実行（逐次出力版）
+
+        標準出力とエラー出力をリアルタイムで表示する。
+
+        Returns:
+            プロセスの終了コード
+        """
+        if self.mount_ns_pid:
+            try:
+                os.kill(int(self.mount_ns_pid), 0)
+                cmd = f"nsenter --target {int(self.mount_ns_pid)} --mount --net bash -c {shlex.quote(command)}"
+            except (OSError, ProcessLookupError):
+                print(f"[warn] mount helper process {self.mount_ns_pid} is dead, falling back")
+                self.mount_ns_pid = None
+                cmd = f"ip netns exec {shlex.quote(self.name)} bash -c {shlex.quote(command)}"
+        else:
+            cmd = f"ip netns exec {shlex.quote(self.name)} bash -c {shlex.quote(command)}"
+
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # stderrをstdoutにマージ
+            text=True,
+            bufsize=1,  # 行バッファリング
+            preexec_fn=os.setsid
+        )
+
+        try:
+            # 逐次出力
+            for line in proc.stdout:
+                print(line, end='')
+
+            # プロセスの終了を待つ
+            return_code = proc.wait(timeout=timeout)
+            return return_code
+
+        except subprocess.TimeoutExpired:
+            print(f"\n[timeout] Command timed out after {timeout}s")
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            proc.wait()
+            return -1
+        except KeyboardInterrupt:
+            print("\n[interrupted] Stopping command...")
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait()
+            return -2
+
+
 # Global nodes registry for convenience
 _nodes = {}
 
@@ -410,7 +464,7 @@ def CLI(nodes: Dict[str, Node]):
     # タブ補完の設定（オプション）
     def completer(text, state):
         """タブ補完関数"""
-        options = list(nodes.keys()) + ['all', 'exit', 'quit', 'help']
+        options = list(nodes.keys()) + ['all', 'exit', 'quit', 'help', 'nodes']
         matches = [opt for opt in options if opt.startswith(text)]
         if state < len(matches):
             return matches[state]
@@ -422,6 +476,7 @@ def CLI(nodes: Dict[str, Node]):
     print("Entering mini CLI. Type 'exit' to quit.")
     # register nodes in global
     _nodes.update(nodes)
+    default_timeout = 30
     try:
         while True:
             try:
@@ -438,9 +493,16 @@ Available commands:
   <node> <command>  - Run command on specific node
   all <command>     - Run command on all nodes
   nodes             - List all nodes
+  timeout <n>       - Set default timeout to n seconds (current: {})
   exit/quit         - Exit CLI
   help              - Show this help
-                """)
+
+Notes:
+  - Single node commands show output in real-time
+  - 'all' commands wait for completion before showing output
+  - Commands timeout after {} seconds by default
+  - Press Ctrl-C to interrupt a running command
+                """.format(default_timeout, default_timeout))
                 continue
             if line == 'nodes':
                 print("Available nodes:")
@@ -448,23 +510,47 @@ Available commands:
                     print(f"  - {name}")
                 continue
 
+            if line.startswith('timeout '):
+                try:
+                    default_timeout = int(line.split()[1])
+                    print(f"Default timeout set to {default_timeout}s")
+                except (ValueError, IndexError):
+                    print("Usage: timeout <seconds>")
+                continue
+
             parts = line.split(maxsplit=1)
             if len(parts) == 1:
                 print("Usage: <node|all> <command>")
                 continue
+
             target, cmd = parts
-            if target == 'all':
-                for n in nodes.values():
-                    out = n.cmd(cmd)
-                    if out:
-                        print(f"[{n.name}] {out}")
-            else:
-                if target not in nodes:
-                    print(f"Unknown node: {target}")
-                    continue
-                out = nodes[target].cmd(cmd)
-                if out:
-                    print(out)
+
+            try:
+                if target == 'all':
+                    for n in nodes.values():
+                        try:
+                            out = n.cmd(cmd, timeout=default_timeout)
+                            if out:
+                                print(f"[{n.name}] {out}")
+                        except subprocess.TimeoutExpired:
+                            print(f"[{n.name}] [TIMEOUT after {default_timeout}s]")
+                        except KeyboardInterrupt:
+                            print(f"\n[{n.name}] Interrupted")
+                            raise
+                else:
+                    if target not in nodes:
+                        print(f"Unknown node: {target}")
+                        print(f"Available nodes: {', '.join(nodes.keys())}")
+                        continue
+
+                    return_code = nodes[target].cmd_stream(cmd, timeout=default_timeout)
+                    # 終了コードが0以外の場合は表示
+                    if return_code not in (0, -1, -2):  # -1=timeout, -2=interrupt
+                        print(f"[exit code: {return_code}]")
+            except KeyboardInterrupt:
+                print("\n[interrupted]")
+                continue
+
     except KeyboardInterrupt:
         print("\nInterrupted")
     finally:
