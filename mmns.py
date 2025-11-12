@@ -38,6 +38,7 @@ import time
 import ipaddress
 from typing import Dict, Tuple
 
+_nodes = {}
 
 def _run(cmd, check=True, capture_output=False, text=True):
     # helper wrapper
@@ -67,6 +68,10 @@ class Node:
         # bring up loopback
         _run(f"ip netns exec {shlex.quote(self.name)} ip link set lo up")
 
+        # register node
+        _nodes[name] = self
+        print(f"[node] Created node '{name}'")
+
     def add_iface(self, ifname=None):
         """インタフェース名を登録して返す"""
         if ifname is None:
@@ -83,6 +88,10 @@ class Node:
             except Exception:
                 pass
             self.mount_ns_pid = None
+
+        # remove from global dict
+        if self.name in _nodes:
+            del _nodes[self.name]
 
     def mount_override(self, target_path: str, src_path: str):
         """指定した target_path を src_path で override する mount namespace helper"""
@@ -436,8 +445,11 @@ def delete_bridge(bridge_name):
     _run(f"ip link delete {bridge_name} type bridge", check=False)
 
 
-def CLI(nodes: Dict[str, Node]):
+def CLI(nodes: Dict[str, Node] = None):
     """簡易 CLI。nodes は名前->Node オブジェクトの辞書。
+
+    Args:
+      nodes: node dict (all nodes registerd in global dict if eliminated)
 
     コマンド形式:
       <node> <command...>
@@ -447,6 +459,13 @@ def CLI(nodes: Dict[str, Node]):
       all uname -a    # 全ノードで実行
       exit
     """
+    if nodes is None:
+        nodes = _nodes
+
+    if not nodes:
+        print("No nodes available. Create nodes first with mmns.Node('name')")
+        return
+
     # 履歴ファイルのパス
     histfile = os.path.join(os.path.expanduser("~"), ".mmns_history")
 
@@ -555,3 +574,24 @@ Notes:
         print("\nInterrupted")
     finally:
         print("Exiting CLI...")
+
+# Utility functions
+def get_node(name: str) -> Node:
+    if name not in _nodes:
+        raise KeyError(f"Node '{name}' not found. Available nodes: {list(_nodes.keys())}")
+    return _nodes[name]
+
+def list_nodes() -> Dict[str, Node]:
+    return _nodes.copy()
+
+def delete_node(name: str):
+    if name in _nodes:
+        node = _nodes[name]
+        node.cleanup()
+        try:
+            _run(f"ip netns delete {shlex.quote(name)}")
+        except Exception:
+            pass
+        print(f"[node] Deleted node '{name}'")
+    else:
+        print(f"[warn] Node '{name}' not found")
