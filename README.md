@@ -8,7 +8,7 @@ mininet-like network environment (IP only)
 2. create node by mmns.Node
 3. create link by mmns.Link
 4. execute command on h1 by h1.cmd('command')
-5. use command line interface (cli) by mmns.CLI( dict )
+5. use command line interface (cli) by mmns.CLI( dict )  
    you can input commands on h1 by "h1 command" for mmns> prompt
 
 typical code
@@ -21,7 +21,7 @@ mmns.Link(h1, h2)
 
 h1.cmd('ip addr add 10.0.0.1/24 dev h1-eth0')
 h2.cmd('ip addr add 10.0.0.2/24 dev h2-eth0')
-mmns.CLI({'h1':h1, 'h2':h2})
+mmns.CLI()
 ```
 (included as test-mmns.py)
 
